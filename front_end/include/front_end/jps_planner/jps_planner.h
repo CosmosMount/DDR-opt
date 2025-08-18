@@ -92,6 +92,8 @@ namespace JPS
             double evaluteTimeOfPos(const double &pos, const double &locallength, const double &startV, const double &endV, const double &maxV, const double &maxA);
 
             bool JPS_check_if_collision(const Eigen::Vector2d &pos);
+
+            double getPathLength() const;
     };
 
 };

@@ -634,6 +634,15 @@ Visualization Manager:
           Use rainbow: true
           Value: false
         - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /planner/markers
+          Name: /planner/markers
+          Namespaces:
+            chairs: true
+            targets: true
+          Queue Size: 100
+          Value: true
+        - Class: rviz/MarkerArray
           Enabled: false
           Marker Topic: /visualizer/convertpointmarkerarraypub
           Name: convertpointmarker
