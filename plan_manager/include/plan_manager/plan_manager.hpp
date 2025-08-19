@@ -84,6 +84,7 @@ private:
     double replan_time_;
     double max_replan_time_;
     double predicted_traj_start_time_;
+    bool enable_tsp_optimization_ = true;  // 是否启用TSP优化
     StateMachine state_machine_ = StateMachine::INIT;
 
 public:
@@ -94,7 +95,10 @@ public:
     bool generateRandomPositions();
     void assignChairsToTargets();
     void visualizeChairsAndTargets();
-    bool solveTSP();
+    bool solvePath();
+    
+    // TSP求解辅助函数
+    std::vector<int> TSPSolver(const std::vector<std::vector<double>>& dist_matrix);
 
     // ROS 回调与主循环
     void MainThread(const ros::TimerEvent& event);
@@ -106,10 +110,6 @@ public:
     bool findJPSRoad();
     void MPCPathPub(const double& traj_start_time);
 };
-
-// ==================================================================================
-// ============================== 实现部分 ===========================================
-// ==================================================================================
 
 PlanManager::PlanManager(ros::NodeHandle nh) : nh_(nh) {
   
@@ -141,8 +141,9 @@ PlanManager::PlanManager(ros::NodeHandle nh) : nh_(nh) {
 
   nh_.param<double>("replan_time", replan_time_, 10000.0);
   nh_.param<double>("max_replan_time", max_replan_time_, 1.0);
+  nh_.param<bool>("enable_tsp_optimization", enable_tsp_optimization_, true);
 
-  ROS_INFO("Plan Manager initialized. Waiting for first odometry message to set up mission...");
+  ROS_INFO("Plan Manager initialized. TSP optimization: %s", enable_tsp_optimization_ ? "enabled" : "disabled");
 
   state_machine_ = StateMachine::IDLE;
   loop_start_time_ = ros::Time::now();
@@ -205,7 +206,7 @@ void PlanManager::goal_callback(const geometry_msgs::PoseStamped::ConstPtr &msg)
       return;
   }
 
-  if (solveTSP()) {
+  if (solvePath()) {
     ROS_INFO("TSP solved. Starting multi-point traversal.");
     current_waypoint_idx_ = 0;
     goal_state_ = ordered_waypoints_[current_waypoint_idx_];
@@ -393,49 +394,127 @@ void PlanManager::visualizeChairsAndTargets() {
     ROS_INFO("Published %zu markers to topic %s.", marker_array.markers.size(), marker_pub_.getTopic().c_str());
 }
 
-bool PlanManager::solveTSP() {
+bool PlanManager::solvePath() {
     if (chair_to_target_assignments_.empty()) {
-        ROS_ERROR("No assignments available for TSP.");
+        ROS_ERROR("No assignments available for path planning.");
         return false;
     }
 
-    // 构建椅子-目标交替的任务点序列
-    std::vector<Eigen::Vector3d> task_waypoints;
-    for (const auto& assignment : chair_to_target_assignments_) {
-        task_waypoints.push_back(chair_positions_[assignment.first]); // 椅子点
-        task_waypoints.push_back(target_positions_[assignment.second]); // 目标点
+    if (!enable_tsp_optimization_) {
+        // 简单策略：按原始顺序访问椅子-目标对
+        ROS_INFO("TSP optimization disabled. Using original assignment order.");
+        ordered_waypoints_.clear();
+        ordered_waypoints_.push_back(current_state_XYTheta_); // 起始点
+        
+        for (const auto& assignment : chair_to_target_assignments_) {
+            ordered_waypoints_.push_back(chair_positions_[assignment.first]);   // 椅子点
+            ordered_waypoints_.push_back(target_positions_[assignment.second]); // 目标点
+        }
+        
+        ROS_INFO("Simple task sequence generated with %zu waypoints.", ordered_waypoints_.size());
+        return true;
     }
 
-    // 在任务点序列中插入起始点
-    std::vector<Eigen::Vector3d> points_to_visit = task_waypoints;
-    points_to_visit.insert(points_to_visit.begin(), current_state_XYTheta_);
+    // TSP优化策略
+    ROS_INFO("Starting TSP optimization for chair visiting order...");
 
-    int num_points = points_to_visit.size();
-    std::vector<std::vector<double>> dist_matrix(num_points, std::vector<double>(num_points, 0.0));
+    // 构建椅子位置列表用于TSP优化
+    std::vector<Eigen::Vector3d> chair_task_points;
+    std::vector<int> chair_indices;
+    for (const auto& assignment : chair_to_target_assignments_) {
+        chair_task_points.push_back(chair_positions_[assignment.first]);
+        chair_indices.push_back(assignment.first);
+    }
 
-    // 计算距离矩阵
-    for (int i = 0; i < num_points; ++i) {
-        for (int j = i + 1; j < num_points; ++j) {
-            bool path_found = jps_planner_->plan(points_to_visit[i], points_to_visit[j]);
-            double len = path_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
-            if (len == std::numeric_limits<double>::max()) {
-                ROS_ERROR("TSP failed: Cannot find path from [%.1f, %.1f] to [%.1f, %.1f].",
-                          points_to_visit[i].x(), points_to_visit[i].y(),
-                          points_to_visit[j].x(), points_to_visit[j].y());
+    // 构建TSP距离矩阵：起始点 + 各个椅子之间的距离
+    int n = chair_task_points.size() + 1; // +1 for starting position
+    std::vector<std::vector<double>> tsp_dist_matrix(n, std::vector<double>(n, 0.0));
+    
+    ROS_INFO("Building TSP distance matrix for %d nodes...", n);
+    
+    // 计算起始点到各椅子的距离
+    for (int j = 1; j < n; ++j) {
+        bool path_found = jps_planner_->plan(current_state_XYTheta_, chair_task_points[j-1]);
+        double len = path_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
+        if (len == std::numeric_limits<double>::max()) {
+            ROS_ERROR("TSP failed: Cannot find path from start to Chair %d.", chair_indices[j-1]);
+            return false;
+        }
+        tsp_dist_matrix[0][j] = tsp_dist_matrix[j][0] = len;
+    }
+    
+    // 计算椅子之间的距离（考虑椅子->目标->下一个椅子的总距离）
+    for (int i = 1; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            // 从椅子i到椅子j的总距离 = 椅子i->目标i + 目标i->椅子j
+            int chair_i_idx = chair_indices[i-1];
+            int chair_j_idx = chair_indices[j-1];
+            
+            // 找到对应的目标
+            int target_i_idx = -1, target_j_idx = -1;
+            for (const auto& assignment : chair_to_target_assignments_) {
+                if (assignment.first == chair_i_idx) target_i_idx = assignment.second;
+                if (assignment.first == chair_j_idx) target_j_idx = assignment.second;
+            }
+            
+            if (target_i_idx == -1 || target_j_idx == -1) {
+                ROS_ERROR("TSP failed: Cannot find target assignments.");
                 return false;
             }
-            dist_matrix[i][j] = dist_matrix[j][i] = len;
+            
+            // 计算椅子i->目标i的距离
+            bool path1_found = jps_planner_->plan(chair_positions_[chair_i_idx], target_positions_[target_i_idx]);
+            double len1 = path1_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
+            
+            // 计算目标i->椅子j的距离
+            bool path2_found = jps_planner_->plan(target_positions_[target_i_idx], chair_positions_[chair_j_idx]);
+            double len2 = path2_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
+            
+            double total_len = len1 + len2;
+            if (len1 == std::numeric_limits<double>::max() || len2 == std::numeric_limits<double>::max()) {
+                total_len = std::numeric_limits<double>::max();
+                ROS_WARN("TSP: Cannot find complete path from Chair %d to Chair %d via targets.", chair_i_idx, chair_j_idx);
+            }
+            
+            tsp_dist_matrix[i][j] = tsp_dist_matrix[j][i] = total_len;
         }
     }
 
-    // 使用贪心算法生成路径（确保顺序）
+    // 使用智能TSP求解器（根据问题规模选择算法）
+    std::vector<int> tsp_path;
+    tsp_path = TSPSolver(tsp_dist_matrix);
+
+    if (tsp_path.empty() || tsp_path[0] != 0) {
+        ROS_ERROR("TSP solver failed to find valid solution.");
+        return false;
+    }
+    
+    // 根据TSP结果构建最终的waypoint序列
     ordered_waypoints_.clear();
-    ordered_waypoints_.push_back(points_to_visit[0]); // 起始点
-    for (size_t i = 0; i < task_waypoints.size(); ++i) {
-        ordered_waypoints_.push_back(task_waypoints[i]);
+    ordered_waypoints_.push_back(current_state_XYTheta_); // 起始点
+    
+    // 按TSP顺序添加椅子-目标对
+    for (int i = 1; i < tsp_path.size(); ++i) {
+        int chair_task_idx = tsp_path[i] - 1; // -1 because tsp_path[0] is start position
+        int chair_idx = chair_indices[chair_task_idx];
+        
+        // 找到对应的目标
+        int target_idx = -1;
+        for (const auto& assignment : chair_to_target_assignments_) {
+            if (assignment.first == chair_idx) {
+                target_idx = assignment.second;
+                break;
+            }
+        }
+        
+        if (target_idx != -1) {
+            ordered_waypoints_.push_back(chair_positions_[chair_idx]);   // 椅子点
+            ordered_waypoints_.push_back(target_positions_[target_idx]); // 目标点
+            ROS_INFO("  Optimized waypoint pair %d: Chair %d -> Target %d", i, chair_idx, target_idx);
+        }
     }
 
-    ROS_INFO("Task sequence with chair-target alternation generated successfully.");
+    ROS_INFO("TSP-optimized task sequence generated successfully with %zu waypoints.", ordered_waypoints_.size());
     return true;
 }
 
@@ -688,9 +767,70 @@ void PlanManager::MPCPathPub(const double& traj_start_time){
   }
   
   mpc_polynome_pub_.publish(polynome);
+}
 
-
-  
+// TSP求解器实现
+std::vector<int> PlanManager::TSPSolver(const std::vector<std::vector<double>>& dist_matrix) {
+    int n = dist_matrix.size();
+    
+    // 动态规划求解TSP - Held-Karp算法
+    // dp[mask][i] = 从起点出发，访问mask中的所有节点，最后到达节点i的最短距离
+    std::vector<std::vector<double>> dp(1 << n, std::vector<double>(n, std::numeric_limits<double>::max()));
+    std::vector<std::vector<int>> parent(1 << n, std::vector<int>(n, -1));
+    
+    // 初始化：从起点0出发到各个节点
+    for (int i = 1; i < n; ++i) {
+        dp[1 << i][i] = dist_matrix[0][i];
+    }
+    
+    // 动态规划填表
+    for (int mask = 1; mask < (1 << n); ++mask) {
+        for (int u = 0; u < n; ++u) {
+            if (!(mask & (1 << u)) || dp[mask][u] == std::numeric_limits<double>::max()) continue;
+            
+            for (int v = 1; v < n; ++v) {
+                if (mask & (1 << v)) continue; // v已经访问过
+                
+                int new_mask = mask | (1 << v);
+                double new_dist = dp[mask][u] + dist_matrix[u][v];
+                
+                if (new_dist < dp[new_mask][v]) {
+                    dp[new_mask][v] = new_dist;
+                    parent[new_mask][v] = u;
+                }
+            }
+        }
+    }
+    
+    // 找到最优解（不回到起点的TSP）
+    int final_mask = (1 << n) - 1 - 1; // 除了起点0的所有节点
+    double min_cost = std::numeric_limits<double>::max();
+    int last_node = -1;
+    
+    for (int i = 1; i < n; ++i) {
+        if (dp[final_mask][i] < min_cost) {
+            min_cost = dp[final_mask][i];
+            last_node = i;
+        }
+    }
+    
+    // 重构路径
+    std::vector<int> path;
+    int mask = final_mask;
+    int curr = last_node;
+    
+    while (curr != -1) {
+        path.push_back(curr);
+        int prev = parent[mask][curr];
+        mask ^= (1 << curr);
+        curr = prev;
+    }
+    path.push_back(0); // 起点
+    
+    std::reverse(path.begin(), path.end());
+    
+    ROS_INFO("TSP exact solution found with cost: %.2f", min_cost);
+    return path;
 }
 
 
