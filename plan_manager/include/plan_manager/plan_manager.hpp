@@ -26,6 +26,7 @@
 
 // 本地模块
 #include "plan_manager/hungarian.hpp"
+#include "plan_manager/branch_and_bound.hpp"
 
 enum StateMachine{
   INIT,
@@ -84,7 +85,6 @@ private:
     double replan_time_;
     double max_replan_time_;
     double predicted_traj_start_time_;
-    bool enable_tsp_optimization_ = true;  // 是否启用TSP优化
     StateMachine state_machine_ = StateMachine::INIT;
 
 public:
@@ -92,10 +92,10 @@ public:
     ~PlanManager();
 
     // 任务规划流程函数
-    bool generateRandomPositions();
-    void assignChairsToTargets();
+    bool generateRandomPositions(int pairs);
     void visualizeChairsAndTargets();
     bool solvePath();
+    bool solvePathWithBranchAndBound();
     
     // TSP求解辅助函数
     std::vector<int> TSPSolver(const std::vector<std::vector<double>>& dist_matrix);
@@ -140,10 +140,7 @@ PlanManager::PlanManager(ros::NodeHandle nh) : nh_(nh) {
   }
 
   nh_.param<double>("replan_time", replan_time_, 10000.0);
-  nh_.param<double>("max_replan_time", max_replan_time_, 1.0);
-  nh_.param<bool>("enable_tsp_optimization", enable_tsp_optimization_, true);
-
-  ROS_INFO("Plan Manager initialized. TSP optimization: %s", enable_tsp_optimization_ ? "enabled" : "disabled");
+  nh_.param<double>("max_replan_time", max_replan_time_, 3.0);
 
   state_machine_ = StateMachine::IDLE;
   loop_start_time_ = ros::Time::now();
@@ -169,7 +166,7 @@ void PlanManager::GeometryCallback(const nav_msgs::Odometry::ConstPtr &msg) {
 
   if (first_time) {
     ROS_INFO("First odometry received. Initializing chair-target mission setup...");
-    if (generateRandomPositions()) {
+    if (generateRandomPositions(6)) {
         visualizeChairsAndTargets();
         ROS_INFO("Initial mission setup complete. Send a goal in RViz to start execution.");
     } else {
@@ -190,23 +187,15 @@ void PlanManager::goal_callback(const geometry_msgs::PoseStamped::ConstPtr &msg)
 
   ROS_INFO("\n\n--- Received Mission Start Signal ---");
   
-  if (!generateRandomPositions()) {
+  if (!generateRandomPositions(6)) {
       ROS_ERROR("Mission aborted: Failed to generate all required chair/target positions.");
       visualizeChairsAndTargets(); // Call to clear any old markers
       state_machine_ = StateMachine::IDLE;
       return;
   }
   visualizeChairsAndTargets();
-  
-  assignChairsToTargets();
-  
-  if (chair_to_target_assignments_.empty()) {
-      ROS_ERROR("Mission aborted: Failed to assign chairs to targets.");
-      state_machine_ = StateMachine::IDLE;
-      return;
-  }
 
-  if (solvePath()) {
+  if (solvePathWithBranchAndBound()) {
     ROS_INFO("TSP solved. Starting multi-point traversal.");
     current_waypoint_idx_ = 0;
     goal_state_ = ordered_waypoints_[current_waypoint_idx_];
@@ -219,7 +208,7 @@ void PlanManager::goal_callback(const geometry_msgs::PoseStamped::ConstPtr &msg)
   ROS_INFO("-------------------------------------\n\n");
 }
 
-bool PlanManager::generateRandomPositions() {
+bool PlanManager::generateRandomPositions(int pairs) {
     srand(time(0)); 
     chair_positions_.clear();
     target_positions_.clear();
@@ -277,56 +266,16 @@ bool PlanManager::generateRandomPositions() {
         }
     };
 
-    generate_points(chair_positions_, 3, "Chair");
-    generate_points(target_positions_, 3, "Target");
+    generate_points(chair_positions_, pairs, "Chair");
+    generate_points(target_positions_, pairs, "Target");
 
-    if (chair_positions_.size() != 3 || target_positions_.size() != 3) {
+    if (chair_positions_.size() != pairs || target_positions_.size() != pairs) {
         ROS_ERROR("Failed to generate all required points. Aborting mission setup.");
         chair_positions_.clear();
         target_positions_.clear();
         return false;
     }
     return true;
-}
-
-void PlanManager::assignChairsToTargets() {
-    int n = chair_positions_.size();
-    if (n == 0) {
-        ROS_WARN("No chair positions available for assignment. Aborting.");
-        return;
-    }
-
-    ROS_INFO("Calculating cost matrix for chair-target assignment...");
-    Eigen::MatrixXd cost_matrix(n, n);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            bool path_found = jps_planner_->plan(chair_positions_[i], target_positions_[j]);
-            if (path_found) {
-                cost_matrix(i, j) = jps_planner_->getPathLength();
-            } else {
-                ROS_WARN("Cannot find a path from Chair %d [%.1f, %.1f] to Target %d [%.1f, %.1f]. Setting cost to infinity.", 
-                         i, chair_positions_[i].x(), chair_positions_[i].y(), 
-                         j, target_positions_[j].x(), target_positions_[j].y());
-                cost_matrix(i, j) = std::numeric_limits<double>::max();
-            }
-        }
-    }
-
-    HungarianAlgorithm ha;
-    std::vector<int> assignment_vec;
-    double min_cost = ha.solve(cost_matrix, assignment_vec);
-
-    chair_to_target_assignments_.clear();
-    if (min_cost >= std::numeric_limits<double>::max()) {
-        ROS_ERROR("Assignment failed. At least one target is unreachable from all chairs.");
-        return;
-    }
-
-    ROS_INFO("Optimal assignment found with total estimated cost: %.2f", min_cost);
-    for (int i = 0; i < n; ++i) {
-        chair_to_target_assignments_.emplace_back(i, assignment_vec[i]);
-        ROS_INFO("  - Assign Chair %d to Target %d", i, assignment_vec[i]);
-    }
 }
 
 void PlanManager::visualizeChairsAndTargets() {
@@ -394,127 +343,66 @@ void PlanManager::visualizeChairsAndTargets() {
     ROS_INFO("Published %zu markers to topic %s.", marker_array.markers.size(), marker_pub_.getTopic().c_str());
 }
 
-bool PlanManager::solvePath() {
-    if (chair_to_target_assignments_.empty()) {
-        ROS_ERROR("No assignments available for path planning.");
+bool PlanManager::solvePathWithBranchAndBound() {
+    if (chair_positions_.empty() || target_positions_.empty()) {
+        ROS_ERROR("No chair or target positions available for path planning.");
         return false;
     }
 
-    if (!enable_tsp_optimization_) {
-        // 简单策略：按原始顺序访问椅子-目标对
-        ROS_INFO("TSP optimization disabled. Using original assignment order.");
-        ordered_waypoints_.clear();
-        ordered_waypoints_.push_back(current_state_XYTheta_); // 起始点
-        
-        for (const auto& assignment : chair_to_target_assignments_) {
-            ordered_waypoints_.push_back(chair_positions_[assignment.first]);   // 椅子点
-            ordered_waypoints_.push_back(target_positions_[assignment.second]); // 目标点
-        }
-        
-        ROS_INFO("Simple task sequence generated with %zu waypoints.", ordered_waypoints_.size());
-        return true;
-    }
+    ROS_INFO("Starting combined Branch and Bound optimization...");
 
-    // TSP优化策略
-    ROS_INFO("Starting TSP optimization for chair visiting order...");
+    // 1. Build the full distance matrix
+    int num_tasks = chair_positions_.size();
+    int matrix_size = 1 + 2 * num_tasks; // 0:start, 1..n:chairs, n+1..2n:targets
+    Eigen::MatrixXd all_dists(matrix_size, matrix_size);
+    std::vector<Eigen::Vector3d> all_points;
+    
+    all_points.push_back(current_state_XYTheta_);
+    all_points.insert(all_points.end(), chair_positions_.begin(), chair_positions_.end());
+    all_points.insert(all_points.end(), target_positions_.begin(), target_positions_.end());
 
-    // 构建椅子位置列表用于TSP优化
-    std::vector<Eigen::Vector3d> chair_task_points;
-    std::vector<int> chair_indices;
-    for (const auto& assignment : chair_to_target_assignments_) {
-        chair_task_points.push_back(chair_positions_[assignment.first]);
-        chair_indices.push_back(assignment.first);
-    }
-
-    // 构建TSP距离矩阵：起始点 + 各个椅子之间的距离
-    int n = chair_task_points.size() + 1; // +1 for starting position
-    std::vector<std::vector<double>> tsp_dist_matrix(n, std::vector<double>(n, 0.0));
-    
-    ROS_INFO("Building TSP distance matrix for %d nodes...", n);
-    
-    // 计算起始点到各椅子的距离
-    for (int j = 1; j < n; ++j) {
-        bool path_found = jps_planner_->plan(current_state_XYTheta_, chair_task_points[j-1]);
-        double len = path_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
-        if (len == std::numeric_limits<double>::max()) {
-            ROS_ERROR("TSP failed: Cannot find path from start to Chair %d.", chair_indices[j-1]);
-            return false;
-        }
-        tsp_dist_matrix[0][j] = tsp_dist_matrix[j][0] = len;
-    }
-    
-    // 计算椅子之间的距离（考虑椅子->目标->下一个椅子的总距离）
-    for (int i = 1; i < n; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            // 从椅子i到椅子j的总距离 = 椅子i->目标i + 目标i->椅子j
-            int chair_i_idx = chair_indices[i-1];
-            int chair_j_idx = chair_indices[j-1];
-            
-            // 找到对应的目标
-            int target_i_idx = -1, target_j_idx = -1;
-            for (const auto& assignment : chair_to_target_assignments_) {
-                if (assignment.first == chair_i_idx) target_i_idx = assignment.second;
-                if (assignment.first == chair_j_idx) target_j_idx = assignment.second;
+    for (int i = 0; i < matrix_size; ++i) {
+        for (int j = i; j < matrix_size; ++j) {
+            if (i == j) {
+                all_dists(i, j) = 0;
+                continue;
             }
-            
-            if (target_i_idx == -1 || target_j_idx == -1) {
-                ROS_ERROR("TSP failed: Cannot find target assignments.");
-                return false;
+            bool path_found = jps_planner_->plan(all_points[i], all_points[j]);
+            double len = path_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
+            if (len >= std::numeric_limits<double>::max()) {
+                 ROS_WARN("Cannot find path between point %d and %d. Setting cost to infinity.", i, j);
             }
-            
-            // 计算椅子i->目标i的距离
-            bool path1_found = jps_planner_->plan(chair_positions_[chair_i_idx], target_positions_[target_i_idx]);
-            double len1 = path1_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
-            
-            // 计算目标i->椅子j的距离
-            bool path2_found = jps_planner_->plan(target_positions_[target_i_idx], chair_positions_[chair_j_idx]);
-            double len2 = path2_found ? jps_planner_->getPathLength() : std::numeric_limits<double>::max();
-            
-            double total_len = len1 + len2;
-            if (len1 == std::numeric_limits<double>::max() || len2 == std::numeric_limits<double>::max()) {
-                total_len = std::numeric_limits<double>::max();
-                ROS_WARN("TSP: Cannot find complete path from Chair %d to Chair %d via targets.", chair_i_idx, chair_j_idx);
-            }
-            
-            tsp_dist_matrix[i][j] = tsp_dist_matrix[j][i] = total_len;
+            all_dists(i, j) = all_dists(j, i) = len;
         }
     }
 
-    // 使用智能TSP求解器（根据问题规模选择算法）
-    std::vector<int> tsp_path;
-    tsp_path = TSPSolver(tsp_dist_matrix);
+    // 2. Solve with the combined B&B solver
+    BranchAndBoundCombined bnb_solver(all_dists, num_tasks);
+    std::vector<int> best_path_indices;
+    double optimal_cost = bnb_solver.solve(best_path_indices);
 
-    if (tsp_path.empty() || tsp_path[0] != 0) {
-        ROS_ERROR("TSP solver failed to find valid solution.");
+    if (optimal_cost >= std::numeric_limits<double>::max()) {
+        ROS_ERROR("Combined B&B failed to find a valid solution.");
         return false;
     }
-    
-    // 根据TSP结果构建最终的waypoint序列
+
+    ROS_INFO("Combined B&B solution found with cost: %.2f", optimal_cost);
+
+    // 3. Reconstruct the waypoint list from the best path indices
     ordered_waypoints_.clear();
-    ordered_waypoints_.push_back(current_state_XYTheta_); // 起始点
-    
-    // 按TSP顺序添加椅子-目标对
-    for (int i = 1; i < tsp_path.size(); ++i) {
-        int chair_task_idx = tsp_path[i] - 1; // -1 because tsp_path[0] is start position
-        int chair_idx = chair_indices[chair_task_idx];
-        
-        // 找到对应的目标
-        int target_idx = -1;
-        for (const auto& assignment : chair_to_target_assignments_) {
-            if (assignment.first == chair_idx) {
-                target_idx = assignment.second;
-                break;
-            }
-        }
-        
-        if (target_idx != -1) {
-            ordered_waypoints_.push_back(chair_positions_[chair_idx]);   // 椅子点
-            ordered_waypoints_.push_back(target_positions_[target_idx]); // 目标点
-            ROS_INFO("  Optimized waypoint pair %d: Chair %d -> Target %d", i, chair_idx, target_idx);
-        }
+    for (int idx : best_path_indices) {
+        ordered_waypoints_.push_back(all_points[idx]);
     }
 
-    ROS_INFO("TSP-optimized task sequence generated successfully with %zu waypoints.", ordered_waypoints_.size());
+    // Print the optimized path
+    std::stringstream path_ss;
+    for(size_t i = 0; i < best_path_indices.size(); ++i) {
+        path_ss << best_path_indices[i] << (i == best_path_indices.size() - 1 ? "" : " -> ");
+    }
+    ROS_INFO("Optimal path sequence (indices): %s", path_ss.str().c_str());
+
+
+    ROS_INFO("Combined B&B optimized task sequence generated successfully with %zu waypoints.", ordered_waypoints_.size());
     return true;
 }
 
