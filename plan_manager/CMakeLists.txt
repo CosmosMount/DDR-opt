@@ -45,3 +45,11 @@ add_executable(global_planning src/global_planning.cpp)
 target_link_libraries(global_planning
   ${catkin_LIBRARIES}
 )
+
+# 添加新的验证节点可执行文件
+add_executable(mission_validation_node src/mission_validation_node.cpp)
+
+# 链接该节点到ROS库
+target_link_libraries(mission_validation_node
+  ${catkin_LIBRARIES}
+)

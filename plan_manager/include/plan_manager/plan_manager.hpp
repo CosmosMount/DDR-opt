@@ -17,6 +17,7 @@
 #include "std_msgs/Bool.h"
 #include "visualization_msgs/MarkerArray.h"
 #include "tf/tf.h"
+#include "std_msgs/Int32MultiArray.h"
 
 // C++ 标准库
 #include <thread>
@@ -56,7 +57,8 @@ private:
     int current_waypoint_idx_;
 
     // ROS 通信
-    ros::Subscriber goal_sub_;
+    ros::Subscriber items_sub_;
+    ros::Subscriber targets_sub_;
     ros::Subscriber current_state_sub_;
     ros::Timer main_thread_timer_;
     ros::Publisher cmd_pub_;
@@ -64,6 +66,8 @@ private:
     ros::Publisher emergency_stop_pub_;
     ros::Publisher record_pub_;
     ros::Publisher marker_pub_;
+    ros::Publisher chair_order_pub_;
+    ros::Publisher target_order_pub_;
 
     // 状态变量
     ros::Time current_time_;
@@ -80,6 +84,8 @@ private:
     ros::Time loop_start_time_;
     bool have_geometry_;
     bool have_goal_;
+    bool have_items_;
+    bool have_targets_;
     bool if_fix_final_;
     Eigen::Vector3d final_state_;
     double replan_time_;
@@ -92,18 +98,15 @@ public:
     ~PlanManager();
 
     // 任务规划流程函数
-    bool generateRandomPositions(int pairs);
     void visualizeChairsAndTargets();
-    bool solvePath();
     bool solvePathWithBranchAndBound();
-    
-    // TSP求解辅助函数
-    std::vector<int> TSPSolver(const std::vector<std::vector<double>>& dist_matrix);
+    void trigger_planning();
 
     // ROS 回调与主循环
     void MainThread(const ros::TimerEvent& event);
     void GeometryCallback(const nav_msgs::Odometry::ConstPtr &msg);
-    void goal_callback(const geometry_msgs::PoseStamped::ConstPtr &msg);
+    void items_callback(const geometry_msgs::PoseArray::ConstPtr& msg);
+    void targets_callback(const geometry_msgs::PoseArray::ConstPtr& msg);
     
     // 辅助函数
     void printStateMachine();
@@ -118,7 +121,8 @@ PlanManager::PlanManager(ros::NodeHandle nh) : nh_(nh) {
   msplanner_ = std::make_shared<MSPlanner>(Config(ros::NodeHandle("~")), nh_, sdfmap_);
   jps_planner_ = std::make_shared<JPS::JPSPlanner>(sdfmap_, nh_);
 
-  goal_sub_ = nh_.subscribe<geometry_msgs::PoseStamped>("/move_base_simple/goal", 1, &PlanManager::goal_callback, this);
+  items_sub_ = nh_.subscribe<geometry_msgs::PoseArray>("/mission/items", 1, &PlanManager::items_callback, this);
+  targets_sub_ = nh_.subscribe<geometry_msgs::PoseArray>("/mission/targets", 1, &PlanManager::targets_callback, this);
   current_state_sub_ = nh_.subscribe<nav_msgs::Odometry>("odom", 1, &PlanManager::GeometryCallback, this);
   main_thread_timer_ = nh_.createTimer(ros::Duration(0.001), &PlanManager::MainThread, this);
   
@@ -127,9 +131,13 @@ PlanManager::PlanManager(ros::NodeHandle nh) : nh_(nh) {
   record_pub_ = nh_.advertise<visualization_msgs::Marker>("/planner/calculator_time", 1);
   mpc_polynome_pub_ = nh_.advertise<carstatemsgs::Polynome>("traj", 1);
   marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/planner/markers", 10, true);
+  chair_order_pub_ = nh_.advertise<std_msgs::Int32MultiArray>("/mission/results/chair_order", 10);
+  target_order_pub_ = nh_.advertise<std_msgs::Int32MultiArray>("/mission/results/target_order", 10);
 
   have_geometry_ = false;
   have_goal_ = false;
+  have_items_ = false;
+  have_targets_ = false;
   current_waypoint_idx_ = -1;
 
   nh_.param<bool>("if_fix_final", if_fix_final_, false);
@@ -156,126 +164,72 @@ void PlanManager::printStateMachine() {
 }
 
 void PlanManager::GeometryCallback(const nav_msgs::Odometry::ConstPtr &msg) {
-  bool first_time = !have_geometry_;
-
   have_geometry_ = true;
   current_state_XYTheta_ << msg->pose.pose.position.x, msg->pose.pose.position.y, tf::getYaw(msg->pose.pose.orientation);
   current_state_VAJ_ << 0.0, 0.0, 0.0;
   current_state_OAJ_ << 0.0, 0.0, 0.0;
   current_time_ = msg->header.stamp;
-
-  if (first_time) {
-    ROS_INFO("First odometry received. Initializing chair-target mission setup...");
-    if (generateRandomPositions(6)) {
-        visualizeChairsAndTargets();
-        ROS_INFO("Initial mission setup complete. Send a goal in RViz to start execution.");
-    } else {
-        ROS_ERROR("Initial mission setup failed. Please check the map and restart.");
-    }
-  }
 }
 
-void PlanManager::goal_callback(const geometry_msgs::PoseStamped::ConstPtr &msg) {
-  if (state_machine_ != StateMachine::IDLE) {
-    ROS_WARN("Planner is busy. Ignoring new mission start signal.");
-    return;
-  }
-  if (!have_geometry_) {
-    ROS_ERROR("No odometry received. Cannot start mission.");
-    return;
-  }
-
-  ROS_INFO("\n\n--- Received Mission Start Signal ---");
-  
-  if (!generateRandomPositions(6)) {
-      ROS_ERROR("Mission aborted: Failed to generate all required chair/target positions.");
-      visualizeChairsAndTargets(); // Call to clear any old markers
-      state_machine_ = StateMachine::IDLE;
-      return;
-  }
-  visualizeChairsAndTargets();
-
-  if (solvePathWithBranchAndBound()) {
-    ROS_INFO("TSP solved. Starting multi-point traversal.");
-    current_waypoint_idx_ = 0;
-    goal_state_ = ordered_waypoints_[current_waypoint_idx_];
-    have_goal_ = true;
-  } else {
-    ROS_ERROR("Failed to solve TSP. Aborting mission.");
-    state_machine_ = StateMachine::IDLE;
-    have_goal_ = false;
-  }
-  ROS_INFO("-------------------------------------\n\n");
-}
-
-bool PlanManager::generateRandomPositions(int pairs) {
-    srand(time(0)); 
+void PlanManager::items_callback(const geometry_msgs::PoseArray::ConstPtr& msg) {
+    ROS_INFO("Received %zu item positions.", msg->poses.size());
     chair_positions_.clear();
+    for (const auto& pose : msg->poses) {
+        chair_positions_.emplace_back(pose.position.x, pose.position.y, tf::getYaw(pose.orientation));
+    }
+    have_items_ = true;
+    visualizeChairsAndTargets();
+    trigger_planning();
+}
+
+void PlanManager::targets_callback(const geometry_msgs::PoseArray::ConstPtr& msg) {
+    ROS_INFO("Received %zu target positions.", msg->poses.size());
     target_positions_.clear();
-    std::vector<Eigen::Vector3d> all_generated_points;
+    for (const auto& pose : msg->poses) {
+        target_positions_.emplace_back(pose.position.x, pose.position.y, tf::getYaw(pose.orientation));
+    }
+    have_targets_ = true;
+    visualizeChairsAndTargets();
+    trigger_planning();
+}
 
-    const double safe_dist_from_obstacle = 0.8;
-    const double min_dist_between_points = 1.5;
-    const int max_attempts = 200;
+void PlanManager::trigger_planning() {
+    if (!have_items_ || !have_targets_) {
+        ROS_INFO("Waiting for both items and targets before planning...");
+        return;
+    }
 
+    if (state_machine_ != StateMachine::IDLE) {
+        ROS_WARN("Planner is busy. Ignoring new mission start signal.");
+        return;
+    }
     if (!have_geometry_) {
-        ROS_ERROR("Cannot generate positions without knowing robot's current location.");
-        return false;
+        ROS_ERROR("No odometry received. Cannot start mission.");
+        return;
     }
-    Eigen::Vector3d reference_pos = current_state_XYTheta_;
-    ROS_INFO("Using robot's current position (%.1f, %.1f) as reachability reference.", reference_pos.x(), reference_pos.y());
-
-    auto generate_points = [&](std::vector<Eigen::Vector3d>& point_vector, int num_points, const std::string& name) {
-        ROS_INFO("Generating %d safe and reachable positions for %s...", num_points, name.c_str());
-        for (int i = 0; i < num_points; ++i) {
-            int attempts = 0;
-            while (attempts < max_attempts) {
-                Eigen::Vector3d candidate_pos((rand() % 180 - 90) / 10.0, 
-                                              (rand() % 180 - 90) / 10.0,
-                                              0.0);
-                attempts++;
-
-                if (sdfmap_->getDistanceReal(candidate_pos.head<2>()) < safe_dist_from_obstacle) {
-                    continue;
-                }
-
-                bool self_collision = false;
-                for (const auto& existing_pos : all_generated_points) {
-                    if ((candidate_pos - existing_pos).head<2>().norm() < min_dist_between_points) {
-                        self_collision = true;
-                        break;
-                    }
-                }
-                if (self_collision) {
-                    continue;
-                }
-
-                if (!jps_planner_->plan(reference_pos, candidate_pos)) {
-                    if (attempts % 50 == 0) ROS_WARN("Attempt %d for %s %d: Candidate (%.1f, %.1f) is not reachable.", attempts, name.c_str(), i, candidate_pos.x(), candidate_pos.y());
-                    continue;
-                }
-
-                point_vector.push_back(candidate_pos);
-                all_generated_points.push_back(candidate_pos);
-                ROS_INFO("  - Generated %s %d at (%.1f, %.1f)", name.c_str(), i, candidate_pos.x(), candidate_pos.y());
-                break; 
-            }
-            if (attempts >= max_attempts) {
-                ROS_ERROR("Failed to generate a safe and reachable position for %s %d after %d attempts.", name.c_str(), i, max_attempts);
-            }
-        }
-    };
-
-    generate_points(chair_positions_, pairs, "Chair");
-    generate_points(target_positions_, pairs, "Target");
-
-    if (chair_positions_.size() != pairs || target_positions_.size() != pairs) {
-        ROS_ERROR("Failed to generate all required points. Aborting mission setup.");
-        chair_positions_.clear();
-        target_positions_.clear();
-        return false;
+    if (chair_positions_.size() != target_positions_.size()) {
+        ROS_ERROR("Mismatch between number of items (%zu) and targets (%zu). Aborting.", chair_positions_.size(), target_positions_.size());
+        return;
     }
-    return true;
+
+    ROS_INFO("\n\n--- Received All Mission Data, Starting Planning ---");
+    
+    if (solvePathWithBranchAndBound()) {
+        ROS_INFO("TSP solved. Starting multi-point traversal.");
+        current_waypoint_idx_ = 0;
+        goal_state_ = ordered_waypoints_[current_waypoint_idx_];
+        have_goal_ = true;
+    } else {
+        ROS_ERROR("Failed to solve TSP. Aborting mission.");
+        state_machine_ = StateMachine::IDLE;
+        have_goal_ = false;
+    }
+
+    // Reset flags for the next mission
+    have_items_ = false;
+    have_targets_ = false;
+
+    ROS_INFO("-----------------------------------------------------\n\n");
 }
 
 void PlanManager::visualizeChairsAndTargets() {
@@ -393,6 +347,27 @@ bool PlanManager::solvePathWithBranchAndBound() {
     for (int idx : best_path_indices) {
         ordered_waypoints_.push_back(all_points[idx]);
     }
+
+    // 4. Extract and publish the visit order
+    std_msgs::Int32MultiArray chair_order_msg;
+    std_msgs::Int32MultiArray target_order_msg;
+    std::stringstream chair_ss, target_ss;
+
+    for (int idx : best_path_indices) {
+        if (idx > 0 && idx <= num_tasks) { // Chair index (1 to n)
+            int chair_idx = idx - 1;
+            chair_order_msg.data.push_back(chair_idx);
+            chair_ss << chair_idx << " ";
+        } else if (idx > num_tasks) { // Target index (n+1 to 2n)
+            int target_idx = idx - (num_tasks + 1);
+            target_order_msg.data.push_back(target_idx);
+            target_ss << target_idx << " ";
+        }
+    }
+    chair_order_pub_.publish(chair_order_msg);
+    target_order_pub_.publish(target_order_msg);
+    ROS_INFO("Published optimal chair visit order: [ %s]", chair_ss.str().c_str());
+    ROS_INFO("Published optimal target visit order: [ %s]", target_ss.str().c_str());
 
     // Print the optimized path
     std::stringstream path_ss;
@@ -655,70 +630,6 @@ void PlanManager::MPCPathPub(const double& traj_start_time){
   }
   
   mpc_polynome_pub_.publish(polynome);
-}
-
-// TSP求解器实现
-std::vector<int> PlanManager::TSPSolver(const std::vector<std::vector<double>>& dist_matrix) {
-    int n = dist_matrix.size();
-    
-    // 动态规划求解TSP - Held-Karp算法
-    // dp[mask][i] = 从起点出发，访问mask中的所有节点，最后到达节点i的最短距离
-    std::vector<std::vector<double>> dp(1 << n, std::vector<double>(n, std::numeric_limits<double>::max()));
-    std::vector<std::vector<int>> parent(1 << n, std::vector<int>(n, -1));
-    
-    // 初始化：从起点0出发到各个节点
-    for (int i = 1; i < n; ++i) {
-        dp[1 << i][i] = dist_matrix[0][i];
-    }
-    
-    // 动态规划填表
-    for (int mask = 1; mask < (1 << n); ++mask) {
-        for (int u = 0; u < n; ++u) {
-            if (!(mask & (1 << u)) || dp[mask][u] == std::numeric_limits<double>::max()) continue;
-            
-            for (int v = 1; v < n; ++v) {
-                if (mask & (1 << v)) continue; // v已经访问过
-                
-                int new_mask = mask | (1 << v);
-                double new_dist = dp[mask][u] + dist_matrix[u][v];
-                
-                if (new_dist < dp[new_mask][v]) {
-                    dp[new_mask][v] = new_dist;
-                    parent[new_mask][v] = u;
-                }
-            }
-        }
-    }
-    
-    // 找到最优解（不回到起点的TSP）
-    int final_mask = (1 << n) - 1 - 1; // 除了起点0的所有节点
-    double min_cost = std::numeric_limits<double>::max();
-    int last_node = -1;
-    
-    for (int i = 1; i < n; ++i) {
-        if (dp[final_mask][i] < min_cost) {
-            min_cost = dp[final_mask][i];
-            last_node = i;
-        }
-    }
-    
-    // 重构路径
-    std::vector<int> path;
-    int mask = final_mask;
-    int curr = last_node;
-    
-    while (curr != -1) {
-        path.push_back(curr);
-        int prev = parent[mask][curr];
-        mask ^= (1 << curr);
-        curr = prev;
-    }
-    path.push_back(0); // 起点
-    
-    std::reverse(path.begin(), path.end());
-    
-    ROS_INFO("TSP exact solution found with cost: %.2f", min_cost);
-    return path;
 }
 
 

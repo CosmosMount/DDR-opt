@@ -41,7 +41,7 @@ bool JPSPlanner::plan(const Eigen::Vector3d &start, const Eigen::Vector3d &goal)
     double safe_dis = std::max(std::min(safe_dis_, start_dis), 0.0);
     safe_dis = std::max(std::min(safe_dis, goal_dis), 0.0);
 
-    graph_search_->plan(start_idx(0), start_idx(1), goal_idx(0), goal_idx(1), true, 1e10);
+    graph_search_->plan(start_idx(0), start_idx(1), goal_idx(0), goal_idx(1), true, 1000000);
 
     const auto path = graph_search_->getPath();
     if (path.size() < 1) {
