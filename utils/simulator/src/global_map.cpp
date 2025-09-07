@@ -296,6 +296,121 @@ bool GlobalMap::get_grid_from_png(){
   return true;
 }
 
+
+bool GlobalMap::get_grid_from_pcd() {
+  std::string pcd_path;
+  double z_thresh;
+
+  nh_.getParam(ros::this_node::getName() + "/Pcd/file_path", pcd_path);
+  nh_.param(ros::this_node::getName() + "/Pcd/z_thresh", z_thresh, 0.3);
+
+  // 姿态参数
+  double x_offset, y_offset, z_offset, roll_deg, pitch_deg, yaw_deg;
+  
+  nh_.param("Pcd/x_offset", x_offset, 5.0);
+  nh_.param("Pcd/y_offset", y_offset, 0.0);
+  nh_.param("Pcd/z_offset", z_offset, 0.0);
+  nh_.param("Pcd/roll_deg", roll_deg, 90.0);
+  nh_.param("Pcd/pitch_deg", pitch_deg, 0.0);
+  nh_.param("Pcd/yaw_deg", yaw_deg, 0.0);
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_raw(new pcl::PointCloud<pcl::PointXYZ>());
+  if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_path, *cloud_raw) == -1) {
+    ROS_ERROR("Failed to load PCD file: %s", pcd_path.c_str());
+    return false;
+  }
+
+  printf("PCD loaded successfully: %s\n", pcd_path.c_str());
+
+  // 构造变换
+  Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+  transform.translation() << x_offset, y_offset, z_offset;
+
+  float roll = roll_deg * M_PI / 180.0;
+  float pitch = pitch_deg * M_PI / 180.0;
+  float yaw = yaw_deg * M_PI / 180.0;
+
+  transform.rotate(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+  transform.rotate(Eigen::AngleAxisf(pitch, Eigen::Vector3f::UnitY()));
+  transform.rotate(Eigen::AngleAxisf(roll, Eigen::Vector3f::UnitX()));
+
+  // 应用变换
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+  pcl::transformPointCloud(*cloud_raw, *cloud, transform);
+
+  // 计算地图边界
+  double x_min = std::numeric_limits<double>::max();
+  double y_min = std::numeric_limits<double>::max();
+  double x_max = -std::numeric_limits<double>::max();
+  double y_max = -std::numeric_limits<double>::max();
+
+  for (const auto& pt : cloud->points) {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    if (pt.z > z_thresh) continue;
+
+    x_min = std::min(x_min, static_cast<double>(pt.x));
+    y_min = std::min(y_min, static_cast<double>(pt.y));
+    x_max = std::max(x_max, static_cast<double>(pt.x));
+    y_max = std::max(y_max, static_cast<double>(pt.y));
+  }
+
+  printf("PCD point cloud bounds: x_min: %.2f, x_max: %.2f, y_min: %.2f, y_max: %.2f\n",
+         x_min, x_max, y_min, y_max);
+
+  x_lower = floor(x_min * inv_grid_interval_) * grid_interval_;
+  y_lower = floor(y_min * inv_grid_interval_) * grid_interval_;
+  x_upper = ceil(x_max * inv_grid_interval_) * grid_interval_;
+  y_upper = ceil(y_max * inv_grid_interval_) * grid_interval_;
+
+  GLX_SIZE = static_cast<int>((x_upper - x_lower) * inv_grid_interval_);
+  GLY_SIZE = static_cast<int>((y_upper - y_lower) * inv_grid_interval_);
+  GLXY_SIZE = GLX_SIZE * GLY_SIZE;
+  EIXY_SIZE << GLX_SIZE, GLY_SIZE;
+
+  printf("Grid map size: %d x %d\n", GLX_SIZE, GLY_SIZE);
+
+  gridmap_ = new uint8_t[GLXY_SIZE];
+  memset(gridmap_, Unoccupied, GLXY_SIZE * sizeof(uint8_t));
+
+  // laser map 初始化
+  laser_x_lower = floor(x_lower * inv_laser_grid_interval_) * laser_grid_interval_;
+  laser_y_lower = floor(y_lower * inv_laser_grid_interval_) * laser_grid_interval_;
+  laser_x_upper = ceil(x_upper * inv_laser_grid_interval_) * laser_grid_interval_;
+  laser_y_upper = ceil(y_upper * inv_laser_grid_interval_) * laser_grid_interval_;
+
+  laser_GLX_SIZE = static_cast<int>(round((laser_x_upper - laser_x_lower) * inv_laser_grid_interval_));
+  laser_GLY_SIZE = static_cast<int>(round((laser_y_upper - laser_y_lower) * inv_laser_grid_interval_));
+  laser_GLXY_SIZE = laser_GLX_SIZE * laser_GLY_SIZE;
+  laser_EIXY_SIZE << laser_GLX_SIZE, laser_GLY_SIZE;
+
+  printf("Laser map size: %d x %d\n", laser_GLX_SIZE, laser_GLY_SIZE);
+
+  laser_gridmap_ = new uint8_t[laser_GLXY_SIZE];
+  memset(laser_gridmap_, Unoccupied, laser_GLXY_SIZE * sizeof(uint8_t));
+
+  get_grid_map_ = true;
+
+  // 插入栅格地图
+  for (const auto& pt : cloud->points) {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+    if (pt.z > z_thresh) continue;
+
+    int ix = static_cast<int>((pt.x - x_lower) * inv_grid_interval_);
+    int iy = static_cast<int>((pt.y - y_lower) * inv_grid_interval_);
+
+    if (ix >= 0 && ix < GLX_SIZE && iy >= 0 && iy < GLY_SIZE) {
+      Eigen::Vector2d point = gridIndex2coordd(ix, iy);
+      setObs(point);
+
+      int index = ix * laser_GLY_SIZE + iy;
+      if (index >= 0 && index < laser_GLXY_SIZE)
+        laser_gridmap_[index] = Occupied;
+    }
+  }
+
+  return true;
+}
+
 Eigen::Vector2d GlobalMap::gridIndex2coordd(const Eigen::Vector2i &index){
   Eigen::Vector2d pt;
   pt(0) = ((double)index(0) + 0.5) * grid_interval_ + x_lower;

@@ -342,11 +342,22 @@ bool PlanManager::solvePathWithBranchAndBound() {
 
     ROS_INFO("Combined B&B solution found with cost: %.2f", optimal_cost);
 
-    // 3. Reconstruct the waypoint list from the best path indices
-    ordered_waypoints_.clear();
-    for (int idx : best_path_indices) {
-        ordered_waypoints_.push_back(all_points[idx]);
-    }
+
+  // 3. Reconstruct the waypoint list from the best path indices
+  ordered_waypoints_.clear();
+  for (int idx : best_path_indices) {
+    ordered_waypoints_.push_back(all_points[idx]);
+  }
+
+  // 3.5 计算路径总长度
+  double total_path_length = 0.0;
+  for (size_t i = 1; i < ordered_waypoints_.size(); ++i) {
+    // 使用JPS路径长度（如不可达则用欧氏距离）
+    bool found = jps_planner_->plan(ordered_waypoints_[i-1], ordered_waypoints_[i]);
+    double seg_len = found ? jps_planner_->getPathLength() : (ordered_waypoints_[i-1] - ordered_waypoints_[i]).head(2).norm();
+    total_path_length += seg_len;
+  }
+  ROS_INFO("[Path Info] Total planned path length: %.3f m", total_path_length);
 
     // 4. Extract and publish the visit order
     std_msgs::Int32MultiArray chair_order_msg;
@@ -377,8 +388,16 @@ bool PlanManager::solvePathWithBranchAndBound() {
     ROS_INFO("Optimal path sequence (indices): %s", path_ss.str().c_str());
 
 
-    ROS_INFO("Combined B&B optimized task sequence generated successfully with %zu waypoints.", ordered_waypoints_.size());
-    return true;
+  ROS_INFO("Combined B&B optimized task sequence generated successfully with %zu waypoints.", ordered_waypoints_.size());
+
+  // 3.6 规划总耗时（如有多段轨迹可累加）
+  if (msplanner_ && msplanner_->final_traj_.getTotalDuration() > 0.0) {
+    double total_time = msplanner_->final_traj_.getTotalDuration();
+    ROS_INFO("[Path Info] Total planned trajectory time: %.3f s", total_time);
+  } else {
+    ROS_WARN("[Path Info] Trajectory duration unavailable.");
+  }
+  return true;
 }
 
 void PlanManager::MainThread(const ros::TimerEvent& event) {

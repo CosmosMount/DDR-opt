@@ -50,4 +50,5 @@ target_link_libraries(
   global_map_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
+  ${PCL_LIBRARIES}
 )

@@ -18,7 +18,9 @@
 #include <sensor_msgs/PointCloud2.h>
 
 #include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+#include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <opencv2/opencv.hpp>
@@ -61,6 +63,7 @@ class GlobalMap{
         bool get_grid_from_yaml();
         bool get_grid_from_random();
         bool get_grid_from_png();
+        bool get_grid_from_pcd();
         
         bool get_laser_grid_from_yaml();
 
@@ -125,6 +128,14 @@ class GlobalMap{
                 }
                 else
                     ROS_ERROR("Reading map parameters from png file. ERROR!!!");
+                break;
+                }
+                case 4:{
+                if(get_grid_from_pcd()){
+                    ROS_INFO("Reading laser grid map parameters from pcd file. SUCCESS!!!");
+                }
+                else
+                    ROS_ERROR("Reading laser grid map parameters from pcd file. ERROR!!!");
                 break;
                 }
                 default:

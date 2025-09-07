@@ -2,8 +2,8 @@
   <!-- Whether the start and end points are fixed -->
   <arg name="if_fix_final_" value="false"/> 
   <!-- <arg name="if_fix_final_" value="true"/> -->
-  <arg name="start_x_" value="-7.75"/>
-  <arg name="start_y_" value="-0.5"/>
+  <arg name="start_x_" value="4.5"/>
+  <arg name="start_y_" value="2.0"/>
   <arg name="start_yaw_" value="0.0"/>
   <arg name="final_x_" value="3.7"/>
   <arg name="final_y_" value="0.3"/>
@@ -68,10 +68,10 @@
     <param name="gridmap_interval" value="$(arg gridmap_interval_)"/>
     <param name="path_gridmap_interval" value="0.05"/>
     <param name="detection_range" value="$(arg detection_range_)"/>
-    <param name="global_x_lower" value="-10.0"/>
-    <param name="global_x_upper" value="10.0"/>
-    <param name="global_y_lower" value="-10.0"/>
-    <param name="global_y_upper" value="10.0"/>
+    <param name="global_x_lower" value="-40.0"/>
+    <param name="global_x_upper" value="40.0"/>
+    <param name="global_y_lower" value="-40.0"/>
+    <param name="global_y_upper" value="40.0"/>
     <param name="if_perspective" value="$(arg if_perspective_)"/>
     <param name="if_cirSupRaycast" value="false"/>
     <remap from="~local_pointcloud" to="/laser_simulator/local_pointcloud"/>
@@ -127,7 +127,7 @@
     <!-- 1: Read map from yaml file -->
     <!-- 2: Random obstacles -->
     <!-- 3: Get obstacles from png -->
-    <param name="Map_input_method" value="2"/>
+    <param name="Map_input_method" value="4"/>
     <param name="if_boundary_wall" value="true"/>
     <!-- gridmap cell size -->
     <param name="gridmap_interval" value="$(arg gridmap_interval_)"/>
@@ -154,6 +154,14 @@
     <param name="Png/file_path" value="$(find plan_env)/config/obs.png"/>
     <param name="Png/x_lower" value="-5.0"/>
     <param name="Png/y_lower" value="-5.0"/>
+    <!-- Get obstacles from pcd -->
+    <param name="Pcd/file_path" value="$(find plan_env)/config/office14.pcd"/>
+    <param name="/Pcd/z_thresh" value="5.0"/>
+
+    <param name="/Pcd/roll" value="0.0"/>
+    <param name="/Pcd/pitch" value="0.0"/>
+    <param name="/Pcd/yaw" value="0.0"/>
+
   </node>
 
   <group if="$(arg if_perspective_)">
@@ -208,5 +216,43 @@
 
 
   <node name="rviz" pkg="rviz" type="rviz" args="-d $(find plan_manager)/rviz/planner_sim.rviz" output="log"/>
+
+  <!-- Mission item and target positions as parameters -->
+  <param name="item1_x" value="2.5"/>
+  <param name="item1_y" value="6.0"/>
+  <param name="item2_x" value="-2.0"/>
+
+  <!-- Item and target positions (without offset) -->
+  <param name="item1_x" value="-2.0"/>
+  <param name="item1_y" value="4.0"/>
+  <param name="item2_x" value="-6.5"/>
+  <param name="item2_y" value="-3.0"/>
+  <param name="item3_x" value="0.0"/>
+  <param name="item3_y" value="-11.0"/>
+  <param name="item4_x" value="8.0"/>
+  <param name="item4_y" value="-5.0"/>
+
+  <!-- Chairs -->
+  <!-- <param name="target1_x" value="-1.0"/>
+  <param name="target1_y" value="-3.5"/>
+  <param name="target2_x" value="2.5"/>
+  <param name="target2_y" value="-4.5"/>
+  <param name="target3_x" value="-1.0"/>
+  <param name="target3_y" value="-5.5"/>
+  <param name="target4_x" value="2.5"/>
+  <param name="target4_y" value="-2.5"/> -->
+
+  <!-- Boxes -->
+  <param name="target1_x" value="11.0"/>
+  <param name="target1_y" value="-13.0"/>
+  <param name="target2_x" value="9.5"/>
+  <param name="target2_y" value="-13.0"/>
+  <param name="target3_x" value="8.0"/>
+  <param name="target3_y" value="-13.0"/>
+  <param name="target4_x" value="6.5"/>
+  <param name="target4_y" value="-13.0"/>
+
+  <!-- Launch mission_validation_node -->
+  <node name="mission_validation_node" pkg="plan_manager" type="mission_validation_node" output="screen"/>
 
 </launch> 
